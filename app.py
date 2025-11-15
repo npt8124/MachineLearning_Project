@@ -1,213 +1,99 @@
 # app.py
-"""
-Streamlit app: Nhận dạng chữ số viết tay (MNIST) bằng K-NN
-Yêu cầu:
-- model.joblib (chứa dict: {"model":knn, "scaler":..., "pca":...}) trong cùng thư mục
-- optional: streamlit-drawable-canvas để vẽ trực tiếp
-Chạy:
-    streamlit run app.py
-"""
-
+#type: ignore
 import streamlit as st
-from PIL import Image, ImageOps, Image
+from streamlit_drawable_canvas import st_canvas
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, Input
+from tensorflow.keras.utils import to_categorical
 import numpy as np
-import joblib
-import os
-import io
+from PIL import Image
+import cv2
 
-st.set_page_config(page_title="MNIST K-NN (Streamlit)", layout="centered")
-st.title("Nhận dạng chữ số viết tay (MNIST) — K-NN")
-st.markdown("Upload ảnh chữ số hoặc vẽ trực tiếp. App dùng model `model.joblib` (0-9).")
+# ================= Model architecture =================
+def build_cnn_model():
+    # Tạo model mới **mỗi lần gọi**
+    model = Sequential([
+        Conv2D(32, (3,3), activation='relu', input_shape=(28,28,1)),
+        MaxPooling2D((2,2)),
+        Conv2D(64, (3,3), activation='relu'),
+        MaxPooling2D((2,2)),
+        Flatten(),
+        Dense(128, activation='relu'),
+        Dropout(0.5),
+        Dense(10, activation='softmax')
+    ])
+    return model
 
-MODEL_PATH = "model.joblib"
+# ================= Load model =================
+model = build_cnn_model()
+model.load_weights('models/mnist_cnn.weights.h5')  # file train_cnn.py tạo ra
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 
-@st.cache_resource
-def load_model(path=MODEL_PATH):
-    if not os.path.exists(path):
-        return None
-    bundle = joblib.load(path)
-    return bundle
+# ================= Streamlit UI =================
+st.title("Nhận dạng nhiều chữ số MNIST")
+st.write("Chọn chế độ: vẽ canvas hoặc upload ảnh")
 
-bundle = load_model()
+mode = st.radio("Chọn chế độ", ["Vẽ canvas", "Upload ảnh"])
 
-if bundle is None:
-    st.warning("Không tìm thấy file `model.joblib` trong thư mục. Bạn có thể:")
-    st.markdown("- Chạy script huấn luyện (ví dụ `train_knn.py`) để tạo `model.joblib`.\n- Hoặc upload file `model.joblib` bằng control dưới đây.")
-    uploaded = st.file_uploader("Upload file model.joblib (tùy chọn)", type=["joblib"])
-    if uploaded is not None:
-        with open(MODEL_PATH, "wb") as f:
-            f.write(uploaded.getbuffer())
-        st.success("Đã upload model.joblib. Reload trang để load model.")
-    st.stop()
+# ================= Hàm detect nhiều chữ số + bounding box =================
+def detect_and_predict(image):
+    img_cv = np.array(image.convert('L'))
+    img_cv = cv2.bitwise_not(img_cv)  # đen thành trắng, trắng thành đen
+    _, thresh = cv2.threshold(img_cv, 50, 255, cv2.THRESH_BINARY)
+    
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    output_img = np.array(image.convert('RGB'))
+    predictions = []
 
-model = bundle.get("model", None)
-scaler = bundle.get("scaler", None)
-pca = bundle.get("pca", None)
+    # Sắp xếp contours theo trục x để đọc từ trái sang phải
+    contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[0])
 
-st.sidebar.subheader("Model info")
-if model is not None:
-    st.sidebar.write(f"Model: {type(model).__name__}")
-    try:
-        st.sidebar.write(f"n_neighbors = {model.n_neighbors}")
-    except Exception:
-        pass
-else:
-    st.sidebar.write("Chưa có model trong model.joblib")
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w < 5 or h < 5:
+            continue
+        roi = img_cv[y:y+h, x:x+w]
+        roi_img = Image.fromarray(roi).resize((28,28))
+        roi_array = np.array(roi_img)/255.0
+        roi_array = roi_array.reshape(1,28,28,1)
+        pred = model.predict(roi_array, verbose=0)[0]
+        pred_label = pred.argmax()
+        predictions.append((x, y, w, h, pred, pred_label))
+        cv2.rectangle(output_img, (x,y), (x+w, y+h), (255,0,0), 2)
+        cv2.putText(output_img, str(pred_label), (x,y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+    return output_img, predictions
 
-# Option: enable drawable canvas
-use_canvas = st.sidebar.checkbox("Cho phép vẽ trực tiếp (canvas)", value=True)
+# ================= Chế độ Canvas =================
+if mode == "Vẽ canvas":
+    canvas_result = st_canvas(
+        fill_color="#FFFFFF",
+        stroke_width=15,
+        stroke_color="#000000",
+        background_color="#FFFFFF",
+        width=400,
+        height=400,
+        drawing_mode="freedraw",
+        key="canvas",
+    )
+    if canvas_result.image_data is not None:
+        img = Image.fromarray(canvas_result.image_data.astype('uint8')).convert('L')
+        output_img, predictions = detect_and_predict(img)
+        st.image(output_img, caption="Kết quả với bounding box", width=400)
 
-# Try to import canvas only if user wants it
-canvas_image = None
-if use_canvas:
-    try:
-        from streamlit_drawable_canvas import st_canvas
-        st.sidebar.write("Canvas: dùng chuột (hoặc bút) để vẽ chữ số màu đen trên nền trắng.")
-        canvas_result = st_canvas(
-            fill_color="rgba(0,0,0,1)",
-            stroke_width=18,
-            background_color="#FFFFFF",
-            height=280,
-            width=280,
-            drawing_mode="freedraw",
-            key="canvas",
-        )
-        if canvas_result is not None and canvas_result.image_data is not None:
-            # image_data is RGBA numpy array (h, w, 4)
-            canvas_img = Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA").convert("RGB")
-            st.image(canvas_img, caption="Ảnh vẽ (canvas)", width=200)
-            canvas_image = canvas_img
-    except Exception as e:
-        st.sidebar.error("Để dùng canvas bạn cần cài `streamlit-drawable-canvas` hoặc bỏ chọn canvas.")
-        # don't stop; allow file upload below
-
-uploaded_file = st.file_uploader("Upload ảnh chữ số (PNG/JPG) — hoặc vẽ ở canvas", type=["png","jpg","jpeg"])
-
-# Select which input to use (priority: upload > canvas)
-img_input = None
-if uploaded_file is not None:
-    try:
+# ================= Chế độ Upload =================
+elif mode == "Upload ảnh":
+    uploaded_file = st.file_uploader("Upload ảnh (png/jpg/jpeg)", type=['png','jpg','jpeg'])
+    if uploaded_file is not None:
         img = Image.open(uploaded_file)
-        st.image(img, caption="Ảnh bạn upload", width=200)
-        img_input = img
-    except Exception as e:
-        st.error("Không thể mở file ảnh. Hãy kiểm tra file.")
-elif canvas_image is not None:
-    img_input = canvas_image
+        output_img, predictions = detect_and_predict(img)
+        st.image(output_img, caption="Kết quả với bounding box", width=800)
 
-if img_input is None:
-    st.info("Upload ảnh hoặc vẽ chữ số để dự đoán.")
-    st.stop()
-
-# Utility: get resample method compatible with Pillow versions
-def get_resample_method():
-    try:
-        return Image.Resampling.LANCZOS
-    except Exception:
-        # Pillow < 10
-        return Image.ANTIALIAS
-
-RESAMPLE = get_resample_method()
-
-def preprocess_image(img: Image.Image, size=(28,28)):
-    """
-    Input: PIL Image (any size, RGB or L)
-    Steps:
-    - convert grayscale
-    - pad to square with white background
-    - resize to (28,28) with Lanczos (ANTIALIAS)
-    - invert (so digit is bright like MNIST) and normalize to 0..1
-    - flatten to (1, 784)
-    """
-    # convert to grayscale
-    img = img.convert("L")
-    # auto-crop surrounding empty border (optional) -> helps centering
-    # but keep safe: use ImageOps.fit with centering via padding
-    old_size = img.size  # (width, height)
-    max_side = max(old_size)
-    # create white square and paste centered
-    new_img = Image.new("L", (max_side, max_side), color=255)
-    paste_pos = ((max_side - old_size[0]) // 2, (max_side - old_size[1]) // 2)
-    new_img.paste(img, paste_pos)
-    # resize to target
-    new_img = new_img.resize(size, RESAMPLE)
-    arr = np.array(new_img).astype(np.float32)
-    # invert: MNIST foreground is white (high) when normalized (we will invert to make foreground high)
-    arr = 255.0 - arr
-    # normalize 0..1
-    arr = arr / 255.0
-    flat = arr.reshape(1, -1)
-    return flat, new_img  # return also processed PIL image for visualization
-
-# Show processed preview and predict button
-st.subheader("Ảnh tiền xử lý (28x28) và dự đoán")
-col1, col2 = st.columns([1,1])
-with col1:
-    st.write("Ảnh gốc")
-    st.image(img_input, width=200)
-with col2:
-    st.write("Ảnh sau tiền xử lý (28x28)")
-    x_vis, proc_img = preprocess_image(img_input, size=(28,28))
-    st.image(proc_img.resize((140,140), RESAMPLE), width=140)
-
-# Predict
-if st.button("Dự đoán chữ số"):
-    x = x_vis  # shape (1,784)
-    # apply scaler/pca same as training (robust: detect expected scale)
-    try:
-        # x currently in 0..1 (preprocess_image normalized)
-        x_orig = x.copy()
-
-        if scaler is not None:
-            # Heuristic: if scaler.mean_ exists and its max > 1 => scaler was fit on 0..255 data
-            scaler_mean = getattr(scaler, "mean_", None)
-            if scaler_mean is not None and np.max(np.abs(scaler_mean)) > 1.0:
-                x_for_scaler = x * 255.0
-            else:
-                x_for_scaler = x.copy()
-
-            # debug prints (remove or comment out when ok)
-            st.write("Input range before scaler:", float(x_for_scaler.min()), float(x_for_scaler.max()))
-            st.write("Scaler mean (sample):", float(np.mean(scaler_mean)) if scaler_mean is not None else "N/A")
-
-            x = scaler.transform(x_for_scaler)
-        else:
-            # if no scaler, keep as-is (0..1)
-            st.write("No scaler in model bundle; using pixel range 0..1 for prediction.")
-
-        if pca is not None:
-            x = pca.transform(x)
-    except Exception as e:
-        st.warning("Lỗi khi áp dụng scaler/pca: kiểm tra model.joblib. Dự đoán sẽ dùng vector gốc.")
-        x = x_orig
-
-    try:
-        pred = model.predict(x)[0]
-        st.success(f"Dự đoán: **{int(pred)}**")
-    except Exception as e:
-        st.error(f"Lỗi khi dự đoán: {e}")
-        st.stop()
-
-    # show probabilities if available
-    if hasattr(model, "predict_proba"):
-        try:
-            probs = model.predict_proba(x)[0]
-            top_idx = np.argsort(probs)[::-1][:5]
-            st.write("Top 5 dự đoán (label : probability):")
-            for idx in top_idx:
-                st.write(f"{idx} : {probs[idx]:.3f}")
-        except Exception:
-            pass
-    else:
-        # try to show neighbor distances (kneighbors)
-        try:
-            dists, idxs = model.kneighbors(x, n_neighbors=min(5, getattr(model, "n_neighbors", 5)))
-            st.write("Khoảng cách đến 5 neighbors (nhỏ = gần):")
-            st.write(np.round(dists[0], 4))
-        except Exception:
-            pass
-
-    # Optional: show raw vector stats
-    if st.checkbox("Hiển thị vector đầu vào (784 dim)"):
-        st.write(x.flatten()[:100].tolist(), " ...")  # show first 100 dims
-    st.write("Scaler present:", scaler is not None)
+# ================= Hiển thị xác suất =================
+if 'predictions' in locals() and predictions:
+    st.subheader("Xác suất dự đoán từng chữ số (từ trái sang phải)")
+    for x, y, w, h, pred, label in predictions:
+        sorted_indices = pred.argsort()[::-1]
+        st.write(f"Bounding box ({x},{y},{w},{h}) - Nhãn dự đoán: {label}")
+        for i in sorted_indices:
+            st.write(f"Số {i}: {pred[i]*100:.2f}%")
+        st.write("---")
